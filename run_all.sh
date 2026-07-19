@@ -2,7 +2,7 @@ export UNMT_WORK_DIR=/kaggle/working/unmt-en-fi
 
 # Stage 0: data (takes a while -- Wikipedia streaming + LID filtering)
 python3 data_prepare.py --max_sentences_per_lang 3000
-python3 train_tokenizer.py
+python3 train_tokenizer.py --vocab_size 8000
 python3 binarize.py
 
 # Measure YOUR actual throughput before committing to a step count
