@@ -180,6 +180,25 @@ class LangIDFilter:
             fasttext.FastText.eprint = lambda *a, **k: (
                 None
             )  # silence a harmless warning fastText prints
+
+            # fasttext is unmaintained by Meta and was never updated for
+            # NumPy>=2.0's stricter `copy=False` semantics: its predict()
+            # does `np.array(probs, copy=False)` on a plain Python tuple,
+            # which ALWAYS requires a copy and so ALWAYS raises ValueError
+            # under NumPy>=2.0 (not intermittent -- every single call). Worse,
+            # the exception then segfaults the interpreter on the way out of
+            # fastText's C++ extension. Patch just fastText's own `np` name
+            # binding (not numpy globally) to restore the old, working
+            # behavior: copy=False -> copy=None ("copy only if needed").
+            _orig_np_array = fasttext.FastText.np.array
+
+            def _np_array_compat(obj, copy=False, **kwargs):
+                if copy is False:
+                    copy = None
+                return _orig_np_array(obj, copy=copy, **kwargs)
+
+            fasttext.FastText.np.array = _np_array_compat
+
             self._ft_model = fasttext.load_model(model_path)
             self.backend = "fasttext"
         except Exception as e:
