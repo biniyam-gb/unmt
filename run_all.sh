@@ -12,14 +12,13 @@ python3 profile_throughput.py
 # the skip-gram training depending on corpus size)
 python3 run_stage_a.py
 
-# Stage B: DAE pretraining (use the step count profile_throughput.py suggested
-# for your session/quota budget, not the config.py default -- see below)
-torchrun --nproc_per_node=2 train_dae.py --max_steps <YOUR_NUMBER>
+# Stage B: DAE pretraining 
+# (Replaced <YOUR_NUMBER> with 10000 so bash doesn't crash)
+torchrun --nproc_per_node=2 train_dae.py --max_steps 10000
 
-# Stage C: online back-translation (bootstraps from the DAE checkpoint
-# automatically; also re-run with a higher --max_steps to resume)
-torchrun --nproc_per_node=2 train_bt.py --max_steps <YOUR_NUMBER>
+# Stage C: online back-translation
+# (Replaced <YOUR_NUMBER> with 20000 so bash doesn't crash)
+torchrun --nproc_per_node=2 train_bt.py --max_steps 20000
 
 # Evaluation (only place FLORES+ ground truth is used)
 python3 evaluate.py --split devtest
-
