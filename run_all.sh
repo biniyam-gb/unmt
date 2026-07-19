@@ -1,7 +1,7 @@
 export UNMT_WORK_DIR=/kaggle/working/unmt-en-fi
 
 # Stage 0: data (takes a while -- Wikipedia streaming + LID filtering)
-python3 data_prepare.py --max_sentences_per_lang 3000000
+python3 data_prepare.py --max_sentences_per_lang 3000
 python3 train_tokenizer.py
 python3 binarize.py
 
@@ -13,12 +13,10 @@ python3 profile_throughput.py
 python3 run_stage_a.py
 
 # Stage B: DAE pretraining 
-# (Replaced <YOUR_NUMBER> with 10000 so bash doesn't crash)
-torchrun --nproc_per_node=2 train_dae.py --max_steps 10000
+torchrun --nproc_per_node=2 train_dae.py --max_steps 1000
 
 # Stage C: online back-translation
-# (Replaced <YOUR_NUMBER> with 20000 so bash doesn't crash)
-torchrun --nproc_per_node=2 train_bt.py --max_steps 20000
+torchrun --nproc_per_node=2 train_bt.py --max_steps 2000
 
 # Evaluation (only place FLORES+ ground truth is used)
 python3 evaluate.py --split devtest
