@@ -3,7 +3,11 @@ sentencepiece>=0.2.0
 sacrebleu>=2.4.0
 
 # Data acquisition (Kaggle-side only; not needed to just run training/eval on already-prepared data)
-datasets>=2.19.0             # for wikimedia/wikipedia and FLORES+ / flores200
+datasets>=2.19.0,<4.0.0      # for wikimedia/wikipedia and FLORES+ / flores200
+                              # NOTE: datasets>=4.0 removed loading-script support entirely,
+                              # which breaks the Muennighoff/flores200 fallback below (it
+                              # ships a flores200.py script). wikimedia/wikipedia is plain
+                              # Parquet and is unaffected either way.
 
 # Language identification for monolingual-purity filtering (data_prepare.py).
 # fastText needs a C++ build toolchain; if `pip install fasttext` fails on your
