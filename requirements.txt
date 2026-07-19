@@ -1,0 +1,17 @@
+# Core
+torch>=2.2                 # DDP, AMP (fp16), nn.Transformer* -- tested against 2.13 in development
+numpy>=1.26,<2.0            # NOTE: pin <2.0 if your Kaggle image has packages compiled against numpy 1.x;
+                             # developed against numpy 2.4 in a from-scratch sandbox with no such constraint,
+                             # so relax this pin if nothing on your image needs it.
+sentencepiece>=0.2.0
+sacrebleu>=2.4.0
+
+# Data acquisition (Kaggle-side only; not needed to just run training/eval on already-prepared data)
+datasets>=2.19.0             # for wikimedia/wikipedia and FLORES+ / flores200
+
+# Language identification for monolingual-purity filtering (data_prepare.py).
+# fastText needs a C++ build toolchain; if `pip install fasttext` fails on your
+# Kaggle image, install langdetect instead -- LangIDFilter falls back to it
+# automatically.
+fasttext>=0.9.2; python_version < "3.13"
+langdetect>=1.0.9            # fallback LID backend, pure Python, always installable
