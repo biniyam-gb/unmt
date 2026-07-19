@@ -1,8 +1,4 @@
 # Core
-torch>=2.2                 # DDP, AMP (fp16), nn.Transformer* -- tested against 2.13 in development
-numpy>=1.26,<2.0            # NOTE: pin <2.0 if your Kaggle image has packages compiled against numpy 1.x;
-                             # developed against numpy 2.4 in a from-scratch sandbox with no such constraint,
-                             # so relax this pin if nothing on your image needs it.
 sentencepiece>=0.2.0
 sacrebleu>=2.4.0
 
