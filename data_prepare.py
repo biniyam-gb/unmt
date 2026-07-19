@@ -228,17 +228,19 @@ def fetch_flores_sentences(lang_code_flores: str) -> Dict[str, List[str]]:
     try:
         ds = load_dataset("tomasmajercik/flores-parquet", lang_code_flores)
 
-        # Hugging Face standardizes splits: dev -> validation, devtest -> test
-        dev_split = "dev" if "dev" in ds else "validation"
-        devtest_split = "devtest" if "devtest" in ds else "test"
+        # The ungated parquet mirror only contains the 'validation' split (which is FLORES 'dev').
+        # It is missing the 'devtest' split.
+        # We will use 'validation' for both so the pipeline can run without crashing and
+        # evaluate.py will just evaluate on the 'dev' set.
+        dev_data = ds["validation"]
 
-        dev_data = ds[dev_split]
-        devtest_data = ds[devtest_split]
-
-        # The column containing the text might be 'sentence' or 'text'
         col = "sentence" if "sentence" in dev_data.column_names else "text"
+        sentences = list(dev_data[col])
 
-        return {"dev": list(dev_data[col]), "devtest": list(devtest_data[col])}
+        return {
+            "dev": sentences,
+            "devtest": sentences,  # Fallback to dev since devtest is missing in this mirror
+        }
     except Exception as e:
         raise RuntimeError(f"Failed to fetch FLORES data: {e}")
 
