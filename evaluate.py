@@ -87,6 +87,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sp = spm.SentencePieceProcessor(model_file=args.spm_model)
 
+    vocab_size = sp.get_piece_size()
+    if vocab_size != MODEL_CFG.vocab_size:
+        print(f"[eval] overriding MODEL_CFG.vocab_size {MODEL_CFG.vocab_size} -> {vocab_size} "
+              f"(derived from the actual tokenizer at {args.spm_model})")
+    MODEL_CFG.vocab_size = vocab_size
+
     with open(os.path.join(args.data_dir, "flores_en.json")) as f:
         flores_en = json.load(f)[args.split]
     with open(os.path.join(args.data_dir, "flores_fi.json")) as f:

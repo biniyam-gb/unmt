@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from config import MODEL_CFG, LANG_A, LANG_B, LANG_IDS, PAD_ID, LABEL_SMOOTHING, MAX_TOKENS_PER_BATCH
 from model import SharedTransformerNMT
-from binarize import BinarizedCorpus
+from binarize import BinarizedCorpus, load_resolved_vocab_size
 from batching import infinite_dae_batch_iterator, infinite_batch_iterator
 from train_dae import dae_loss
 from train_bt import back_translate_batch, reconstruction_loss
@@ -51,12 +51,19 @@ def main():
     default_dir = os.path.join(os.environ.get("UNMT_WORK_DIR", "/kaggle/working/unmt-en-fi"), "data")
     ap.add_argument("--data_dir", default=default_dir)
     ap.add_argument("--max_tokens_per_batch", type=int, default=MAX_TOKENS_PER_BATCH)
+    ap.add_argument("--spm_model", default=os.path.join(default_dir, "spm_joint.model"))
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Profiling on: {device} "
           f"({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU -- this number will NOT reflect Kaggle T4 speed'})")
     fp16 = device.type == "cuda"
+
+    vocab_size = load_resolved_vocab_size(args.data_dir, args.spm_model)
+    if vocab_size != MODEL_CFG.vocab_size:
+        print(f"Overriding MODEL_CFG.vocab_size {MODEL_CFG.vocab_size} -> {vocab_size} "
+              f"(derived from the actual tokenizer) so profiling matches what you'll actually train")
+    MODEL_CFG.vocab_size = vocab_size
 
     corpus_en = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_A}"))
     corpus_fi = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_B}"))

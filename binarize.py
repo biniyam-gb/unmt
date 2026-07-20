@@ -17,18 +17,31 @@ storage/IO versus int64 -- worth doing given we may be re-reading this from
 disk every epoch across a 12-hour Kaggle session.
 """
 import argparse
+import json
 import os
 import numpy as np
 import sentencepiece as spm
 
-from config import MIN_TOKENS_PER_SENT, MAX_TOKENS_PER_SENT, VOCAB_SIZE, LANG_A, LANG_B
+from config import MIN_TOKENS_PER_SENT, MAX_TOKENS_PER_SENT, LANG_A, LANG_B
+
+
+def resolve_vocab_size(spm_model_path: str) -> int:
+    """The trained SentencePiece model file is the single source of truth for
+    vocab size -- never trust a config default or a separately-remembered CLI
+    flag for this, because they can silently drift out of sync with each
+    other (this happened: --vocab_size 8000 was passed to train_tokenizer.py
+    but nothing downstream re-derived it, so the model was built with
+    config.py's stale default of 32000 -- a 4x, silently-wrong mismatch that
+    wasted 3/4 of the embedding table and measurably distorted the loss)."""
+    sp = spm.SentencePieceProcessor(model_file=spm_model_path)
+    return sp.get_piece_size()
 
 
 def binarize_file(txt_path: str, spm_model_path: str, out_prefix: str,
-                   min_len: int = MIN_TOKENS_PER_SENT, max_len: int = MAX_TOKENS_PER_SENT,
-                   vocab_size: int = VOCAB_SIZE) -> dict:
+                   min_len: int = MIN_TOKENS_PER_SENT, max_len: int = MAX_TOKENS_PER_SENT) -> dict:
     sp = spm.SentencePieceProcessor(model_file=spm_model_path)
-    assert sp.get_piece_size() <= 65536, "vocab_size must fit in uint16"
+    vocab_size = sp.get_piece_size()
+    assert vocab_size <= 65536, "vocab_size must fit in uint16"
 
     all_ids = []
     offsets = [0]
@@ -61,10 +74,28 @@ def binarize_file(txt_path: str, spm_model_path: str, out_prefix: str,
         "n_read": n_read, "n_kept": n_kept,
         "n_tokens": int(tokens_arr.shape[0]),
         "mean_len": float(tokens_arr.shape[0] / max(n_kept, 1)),
+        "vocab_size": vocab_size,
     }
     print(f"[{out_prefix}] read={n_read} kept={n_kept} ({100*n_kept/max(n_read,1):.1f}%) "
-          f"total_tokens={stats['n_tokens']} mean_len={stats['mean_len']:.1f}")
+          f"total_tokens={stats['n_tokens']} mean_len={stats['mean_len']:.1f} vocab_size={vocab_size}")
     return stats
+
+
+def load_resolved_vocab_size(data_dir: str, spm_model_path: str = None) -> int:
+    """What every downstream script (run_stage_a.py, train_dae.py, train_bt.py,
+    evaluate.py, profile_throughput.py) should call before building a model --
+    never MODEL_CFG.vocab_size directly, which is only a placeholder default."""
+    meta_path = os.path.join(data_dir, "vocab_size.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            return json.load(f)["vocab_size"]
+    if spm_model_path and os.path.exists(spm_model_path):
+        print(f"[load_resolved_vocab_size] {meta_path} not found; reading {spm_model_path} directly")
+        return resolve_vocab_size(spm_model_path)
+    raise FileNotFoundError(
+        f"Can't resolve vocab_size: neither {meta_path} nor an spm_model path were available. "
+        "Run binarize.py first, or pass --spm_model explicitly."
+    )
 
 
 class BinarizedCorpus:
@@ -96,9 +127,18 @@ if __name__ == "__main__":
     ap.add_argument("--spm_model", default=os.path.join(default_dir, "spm_joint.model"))
     args = ap.parse_args()
 
+    vocab_size = resolve_vocab_size(args.spm_model)
+    print(f"Detected actual tokenizer vocab_size={vocab_size} from {args.spm_model}")
+
     for lang in (LANG_A, LANG_B):
         binarize_file(
             os.path.join(args.data_dir, f"mono.{lang}.txt"),
             args.spm_model,
             os.path.join(args.data_dir, f"bin.{lang}"),
         )
+
+    # single source of truth for every downstream script (run_stage_a.py,
+    # train_dae.py, train_bt.py, evaluate.py all read this rather than trusting
+    # config.py's default or requiring you to pass --vocab_size everywhere)
+    with open(os.path.join(args.data_dir, "vocab_size.json"), "w") as f:
+        json.dump({"vocab_size": vocab_size, "spm_model": args.spm_model}, f)

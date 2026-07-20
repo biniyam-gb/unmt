@@ -125,34 +125,43 @@ Three separately-checkable properties, all implemented as code in
    `/kaggle/working/unmt-en-fi`.
 3. `pip install -r requirements.txt --break-system-packages` (or without the
    flag if your image doesn't need it).
-4. Run stages **in order**:
+4. Run stages **in order** -- either use `run_all.sh` (`bash run_all.sh`, not
+   `sh run_all.sh`) as a starting point, editing the `--max_steps` values once
+   `profile_throughput.py` tells you your real budget, or run the same
+   commands by hand:
 
 ```bash
 export UNMT_WORK_DIR=/kaggle/working/unmt-en-fi
+D="$UNMT_WORK_DIR/data"; SPM="$D/spm_joint.model"
 
 # Stage 0: data (takes a while -- Wikipedia streaming + LID filtering)
-python data_prepare.py --max_sentences_per_lang 3000000
-python train_tokenizer.py
-python binarize.py
+python3 data_prepare.py --max_sentences_per_lang 3000000
+python3 train_tokenizer.py --vocab_size 32000
+python3 binarize.py --spm_model "$SPM"
 
 # Measure YOUR actual throughput before committing to a step count
-python profile_throughput.py
+python3 profile_throughput.py --spm_model "$SPM"
 
 # Stage A: embedding alignment (CPU-bound, no GPU needed, a few hours for
 # the skip-gram training depending on corpus size)
-python run_stage_a.py
+python3 run_stage_a.py --spm_model "$SPM"
 
 # Stage B: DAE pretraining (use the step count profile_throughput.py suggested
 # for your session/quota budget, not the config.py default -- see below)
-torchrun --nproc_per_node=2 train_dae.py --max_steps <YOUR_NUMBER>
+torchrun --nproc_per_node=2 train_dae.py --spm_model "$SPM" --max_steps <YOUR_NUMBER>
 
 # Stage C: online back-translation (bootstraps from the DAE checkpoint
 # automatically; also re-run with a higher --max_steps to resume)
-torchrun --nproc_per_node=2 train_bt.py --max_steps <YOUR_NUMBER>
+torchrun --nproc_per_node=2 train_bt.py --spm_model "$SPM" --max_steps <YOUR_NUMBER>
 
 # Evaluation (only place FLORES+ ground truth is used)
-python evaluate.py --split devtest
+python3 evaluate.py --spm_model "$SPM" --split devtest
 ```
+
+**Every script above now takes `--spm_model` and derives the model's real
+vocab size from it directly** -- if you change `--vocab_size` in
+`train_tokenizer.py`, nothing else needs to change to match; see "Bugs found
+from an actual Kaggle run" below for why this matters.
 
 5. **Kaggle will hard-kill your GPU session at 12 hours**, and your weekly GPU
    quota is ~30 hours (both current as of this writing -- verify against
@@ -250,7 +259,87 @@ real data. What I *did* do, rather than just write code and assert it works:
   in. These can only be checked by actually running it on Kaggle -- which is
   exactly what this system is built for you to do next.
 
-## Expected output quality (honest framing)
+## Bugs found from an actual Kaggle run (post-delivery, real hardware)
+
+Everything in "what was actually tested" above was sandbox/toy-data validation.
+The first real run on Kaggle (2xT4, real Wikipedia data) surfaced four more
+issues that no amount of toy-data testing could have caught, roughly in order
+of severity:
+
+1. **The learning rate schedule was broken -- by far the most serious finding
+   so far.** `noam_lr_lambda()` already computes the COMPLETE target learning
+   rate from Vaswani et al.'s formula (peak ~7e-4 for d_model=512,
+   warmup=4000 -- a normal, sensible value on its own). But `train_dae.py` and
+   `train_bt.py` also set the optimizer's own base `lr=3e-4` and wrapped it in
+   `LambdaLR`, which multiplies the two together -- silently composing two
+   complete learning rates into one, shrinking the REAL effective LR by
+   roughly 3300x (down to ~1e-8 to 1e-11 depending on step). The real training
+   log showed DAE loss essentially flat around 19-20 for 900+ steps and BT
+   loss flat around 19.5 for 200+ steps -- not "needs more steps," but "the
+   model was barely updating at all." Fixed by setting the optimizer's base
+   `lr=1.0` (a pure placeholder) so the Noam formula's output IS the actual
+   LR, matching the standard, correct way this schedule is normally
+   implemented; `config.py`'s `LR_SCALE` (default 1.0) is now an explicit,
+   optional multiplier on top of the correct schedule, not a second absolute
+   rate silently stacked underneath it. Verified numerically after the fix:
+   the schedule now peaks at ~7e-4 as intended, and a fresh toy-scale training
+   run shows loss actually moving (5.93 -> 3.95 -> 3.66 over 15 steps) instead
+   of sitting flat.
+
+2. **Vocab size could silently drift out of sync between the tokenizer and
+   the model.** `train_tokenizer.py --vocab_size 8000` correctly builds an
+   8000-token tokenizer, but nothing downstream automatically picked that up
+   -- `binarize.py`, `run_stage_a.py`, `train_dae.py`, `train_bt.py`, and
+   `evaluate.py` all defaulted to `config.py`'s `VOCAB_SIZE=32000` unless
+   every single CLI flag was manually kept in sync across every script. The
+   real run's Stage A log showed `shape=(32000, 512)` against an actual
+   8000-token vocabulary -- a silent 4x mismatch that wastes most of the
+   embedding table and measurably distorts the loss (24,000 of 32,000 output
+   classes never appear as a real target but still receive gradient signal
+   every step, via the softmax normalization). Fixed by making the trained
+   SentencePiece model file the single, authoritative source of truth:
+   `binarize.py` now derives vocab_size from `sp.get_piece_size()` directly
+   and persists it to `vocab_size.json`; every other script calls
+   `load_resolved_vocab_size()` and overrides `MODEL_CFG.vocab_size`
+   automatically before building any model, printing exactly what it detected
+   and corrected. Re-verified the entire pipeline end to end via real
+   subprocess CLI calls (not function calls with manually-synced config,
+   which is how the sandbox testing before delivery had inadvertently masked
+   this exact bug) with a deliberately mismatched tokenizer vocab size, and
+   confirmed every stage now auto-corrects rather than silently proceeding
+   wrong.
+
+3. **`Muennighoff/flores200` needs `trust_remote_code=True`.** Newer versions
+   of the `datasets` library refuse to execute a dataset repo's custom
+   loading script without explicit opt-in, which broke the fallback path
+   entirely on the first run (`openlanguagedata/flores_plus` is gated and
+   fails without an HF token, and the fallback then failed too, so NO
+   monolingual data was ever written). This one was caught and correctly
+   fixed independently before I saw the log -- merged in as shown.
+
+4. **The Wikipedia streaming download can crash the process on exit even
+   after all real work is done.** `datasets`' streaming backend
+   (fsspec/aiohttp-based HTTP range requests against HF Hub parquet shards)
+   can leave background prefetch/retry threads alive after we `break` out of
+   iteration early; if one of those threads touches the GIL while the
+   interpreter is finalizing at normal process exit, it can hard-crash the
+   whole process (`Aborted (core dumped)`) -- which is what happened on the
+   real run, immediately after the Finnish corpus had already been correctly
+   written to disk. Because the crash happens strictly after `main()`'s
+   actual work completes, and every file write already uses a `with open(...)`
+   block that flushes and closes independently of whatever happens next, the
+   fix is to explicitly drop the streaming iterator as soon as we're done
+   with it (`del ds; gc.collect()`) and force an immediate `os._exit(0)` at
+   the very end of a successful run, skipping Python's normal interpreter
+   finalization (which is what the orphaned background thread was crashing
+   during) entirely. This is a real, if somewhat blunt, fix for a genuine
+   third-party library quirk I can't fully control from here.
+
+`run_all.sh` is now a real, tested file (checked with both `bash -n` and
+`sh -n`) rather than just a command block in this README to copy by hand,
+and includes the `--spm_model` flag every script now needs for the vocab-size
+fix above.
+
 
 Do not expect this to be usable for anything you'd actually rely on. Realistic
 outcomes for a compute-constrained, from-scratch UNMT system on a genuinely

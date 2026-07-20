@@ -21,14 +21,14 @@ import argparse
 import os
 import numpy as np
 
-from config import MODEL_CFG, VOCAB_SIZE, EMB_TOP_FREQ_FOR_ADVERSARIAL, LANG_A, LANG_B
-from binarize import BinarizedCorpus
+from config import MODEL_CFG, EMB_TOP_FREQ_FOR_ADVERSARIAL, LANG_A, LANG_B
+from binarize import BinarizedCorpus, load_resolved_vocab_size
 from align_embeddings import train_skipgram_embeddings, sort_by_frequency, align_embedding_spaces
 
 
 def build_initialization(
-    en_prefix: str, fi_prefix: str, out_path: str,
-    dim: int = MODEL_CFG.d_model, vocab_size: int = VOCAB_SIZE,
+    en_prefix: str, fi_prefix: str, out_path: str, vocab_size: int,
+    dim: int = MODEL_CFG.d_model,
     skipgram_max_sentences: int = 2_000_000, skipgram_epochs: int = 3,
     top_k_for_alignment: int = EMB_TOP_FREQ_FOR_ADVERSARIAL,
     profile_len: int = 2000, n_refine_iters: int = 5, seed: int = 0,
@@ -91,5 +91,13 @@ if __name__ == "__main__":
     ap.add_argument("--en_prefix", default=os.path.join(default_dir, f"bin.{LANG_A}"))
     ap.add_argument("--fi_prefix", default=os.path.join(default_dir, f"bin.{LANG_B}"))
     ap.add_argument("--out_path", default=os.path.join(default_dir, "init_embedding.npy"))
+    ap.add_argument("--data_dir", default=default_dir)
+    ap.add_argument("--spm_model", default=os.path.join(default_dir, "spm_joint.model"))
     args = ap.parse_args()
-    build_initialization(args.en_prefix, args.fi_prefix, args.out_path)
+
+    vocab_size = load_resolved_vocab_size(args.data_dir, args.spm_model)
+    MODEL_CFG.vocab_size = vocab_size  # keep the shared config object consistent for anything else reading it
+    print(f"Using actual tokenizer vocab_size={vocab_size} (derived from {args.spm_model}, "
+          f"not from a config default)")
+
+    build_initialization(args.en_prefix, args.fi_prefix, args.out_path, vocab_size=vocab_size)

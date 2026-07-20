@@ -51,7 +51,18 @@ CSLS_K = 10
 
 # ---- Stage B/C: training -----------------------------------------------------
 MAX_TOKENS_PER_BATCH = 6000        # dynamic batching budget PER GPU
-LR = 3e-4
+# LR_SCALE: noam_lr_lambda() below ALREADY computes the complete target learning
+# rate from Vaswani et al.'s formula (peak ~6.99e-4 for d_model=512, warmup=4000
+# -- a standard, sensible peak LR on its own). LR_SCALE is an OPTIONAL further
+# multiplier on top of that complete schedule, for if you deliberately want to
+# scale the whole curve up or down; 1.0 means "use the paper's schedule exactly,"
+# which is the correct default. An earlier version of this file had a separate
+# LR=3e-4 constant that also got multiplied in via LambdaLR's own base_lr
+# mechanism, silently composing two full learning-rate values together and
+# shrinking the real, effective LR by ~3300x -- discovered from a real training
+# log where loss stayed flat for 900+ steps. If you're tuning this, multiply
+# LR_SCALE, don't reintroduce a second absolute rate.
+LR_SCALE = 1.0
 WARMUP_STEPS = 4000
 LABEL_SMOOTHING = 0.1
 GRAD_CLIP = 1.0

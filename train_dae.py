@@ -24,11 +24,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from config import (
     MODEL_CFG, LANG_A, LANG_B, LANG_IDS, PAD_ID,
-    LR, WARMUP_STEPS, LABEL_SMOOTHING, GRAD_CLIP, DAE_STEPS,
+    LR_SCALE, WARMUP_STEPS, LABEL_SMOOTHING, GRAD_CLIP, DAE_STEPS,
     CHECKPOINT_EVERY_STEPS, CHECKPOINT_EVERY_SECONDS, MAX_TOKENS_PER_BATCH,
 )
 from model import SharedTransformerNMT
-from binarize import BinarizedCorpus
+from binarize import BinarizedCorpus, load_resolved_vocab_size
 from batching import infinite_dae_batch_iterator
 from utils_dist import setup_ddp, cleanup_ddp, is_main_process, save_checkpoint, load_checkpoint, WallClockCheckpointTrigger
 
@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--data_dir", default=default_dir)
     ap.add_argument("--out_dir", default=os.path.join(os.environ.get("UNMT_WORK_DIR", "/kaggle/working/unmt-en-fi"), "checkpoints"))
     ap.add_argument("--init_embedding", default=os.path.join(default_dir, "init_embedding.npy"))
+    ap.add_argument("--spm_model", default=os.path.join(default_dir, "spm_joint.model"))
     ap.add_argument("--max_steps", type=int, default=DAE_STEPS)
     ap.add_argument("--max_tokens_per_batch", type=int, default=MAX_TOKENS_PER_BATCH)
     ap.add_argument("--log_every", type=int, default=100)
@@ -64,6 +65,12 @@ def main():
 
     rank, world_size, local_rank, device = setup_ddp()
     fp16 = device.type == "cuda"  # T4 = Turing: fp16 AMP, not bf16 (no native bf16 tensor cores)
+
+    vocab_size = load_resolved_vocab_size(args.data_dir, args.spm_model)
+    if vocab_size != MODEL_CFG.vocab_size and is_main_process(rank):
+        print(f"[DAE] overriding MODEL_CFG.vocab_size {MODEL_CFG.vocab_size} -> {vocab_size} "
+              f"(derived from the actual tokenizer, not the config default)")
+    MODEL_CFG.vocab_size = vocab_size
 
     corpus_en = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_A}"))
     corpus_fi = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_B}"))
@@ -82,9 +89,14 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.98), eps=1e-9)
+    # lr=1.0 is deliberate: noam_lr_lambda() already returns the COMPLETE target
+    # LR (Vaswani et al.'s formula), so LambdaLR's base_lr must be a pure 1.0
+    # placeholder -- setting it to any other value would silently multiply a
+    # second learning rate on top of the first (this was a real, shipped bug;
+    # see the comment on LR_SCALE in config.py).
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda s: noam_lr_lambda(s, MODEL_CFG.d_model, WARMUP_STEPS)
+        optimizer, lr_lambda=lambda s: LR_SCALE * noam_lr_lambda(s, MODEL_CFG.d_model, WARMUP_STEPS)
     )
     scaler = torch.amp.GradScaler("cuda", enabled=fp16)
 
