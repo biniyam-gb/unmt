@@ -2,40 +2,22 @@
 Stage 0: build clean, non-overlapping monolingual corpora for EN and FI, and
 fetch the FLORES+ ground truth that is used ONLY for final evaluation.
 
-"No overlap" is treated as three concrete, separately-checkable properties,
-not a vibe:
-
-  (1) MONOLINGUAL PURITY: each corpus contains only its own language. Wikipedia
-      dumps routinely contain quoted foreign text, loanword-heavy sentences,
-      and stray templates in other scripts. We run fastText's lid.176 language
-      identifier over every candidate sentence and drop anything that isn't
-      confidently the expected language.
-
-  (2) NO DUPLICATE / NEAR-DUPLICATE SENTENCES within or across the two
-      training corpora (catches templated Wikipedia boilerplate that would
-      otherwise let the model memorize instead of generalize, and catches any
-      stray identical lines between the EN and FI corpora -- e.g. bare
-      numbers, URLs, or proper nouns that are spelled identically in both).
-
-  (3) ZERO TEST-SET LEAKAGE: neither monolingual corpus may contain a sentence
-      that also appears (exactly or near-exactly) in the FLORES+ dev/devtest
-      sets, which are reserved exclusively for evaluation. This is checked
-      explicitly against the actual FLORES+ sentences, not assumed.
-
-Run on Kaggle with internet enabled. This script is NOT runnable in a
-sandboxed, no-internet environment -- see README.md for how it was tested
-(dedup/near-dup/shingle-index logic validated on synthetic text; the actual
-Wikipedia/FLORES+ download path can only be exercised on Kaggle itself).
+"No overlap" is treated as three concrete, separately-checkable properties:
+  (1) MONOLINGUAL PURITY via fastText lid.176 filtering
+  (2) NO DUPLICATE / NEAR-DUPLICATE SENTENCES
+  (3) ZERO TEST-SET LEAKAGE vs FLORES+
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import os
 import re
+import sys
 import unicodedata
 from collections import defaultdict
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from config import (
     FLORES_CODE,
@@ -49,15 +31,8 @@ from config import (
 ISO2_TO_FASTTEXT = {
     "en": "en",
     "fi": "fi",
-}  # fastText lid.176 uses ISO 639-1 codes directly
+}
 
-# ---------------------------------------------------------------------------
-# Sentence splitting -- dependency-free, rule-based. Good enough for building
-# a monolingual training corpus (UNMT is already robust to imperfect sentence
-# boundaries); NOT a claim of linguistic-quality segmentation. Swap in pysbd
-# or spaCy's sentencizer if you want higher precision and don't mind the
-# extra dependency / model download.
-# ---------------------------------------------------------------------------
 _ABBREV = {
     "mr",
     "mrs",
@@ -95,7 +70,7 @@ def split_sentences(text: str) -> List[str]:
             r"[A-Za-z]+$", buf[:-1] if buf.endswith((".", "!", "?")) else buf
         )
         if last_word and last_word[-1].lower() in _ABBREV:
-            continue  # likely a false sentence boundary after an abbreviation; keep accumulating
+            continue
         out.append(buf)
         buf = ""
     if buf:
@@ -103,10 +78,6 @@ def split_sentences(text: str) -> List[str]:
     return [s.strip() for s in out if s.strip()]
 
 
-# ---------------------------------------------------------------------------
-# Normalization used for hashing / dedup comparisons (NOT used to alter the
-# actual stored text -- only to decide whether two strings "are the same").
-# ---------------------------------------------------------------------------
 def normalize_for_hash(s: str) -> str:
     s = unicodedata.normalize("NFKC", s).lower()
     s = re.sub(r"\s+", " ", s).strip()
@@ -121,37 +92,14 @@ def char_ngrams(s: str, n: int = 5) -> Set[str]:
     return {s[i : i + n] for i in range(len(s) - n + 1)}
 
 
-def jaccard(a: Set[str], b: Set[str]) -> float:
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-
 def containment(a: Set[str], b: Set[str]) -> float:
-    """Overlap coefficient: |A n B| / min(|A|,|B|). Unlike Jaccard, this does
-    NOT get diluted when one string contains the other plus extra content
-    (e.g. a FLORES sentence quoted verbatim with a trailing citation clause
-    appended) -- exactly the leak pattern most likely in scraped web/Wikipedia
-    text. This was empirically necessary: symmetric Jaccard scored a FLORES
-    sentence + appended clause at 0.72 and missed it at a 0.8 threshold; the
-    same case scores ~1.0 under containment. See test_data_prepare.py."""
     if not a or not b:
         return 0.0
     inter = len(a & b)
     return inter / min(len(a), len(b))
 
 
-# ---------------------------------------------------------------------------
-# (1) Language-ID filtering
-# ---------------------------------------------------------------------------
 class LangIDFilter:
-    """Wraps fastText's lid.176 model. Falls back to `langdetect` (pure
-    Python, less accurate but has no binary-model download dependency) if
-    fastText or its model file are unavailable, so the pipeline degrades
-    gracefully rather than hard-failing on a network hiccup."""
-
     LID_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
 
     def __init__(self, cache_dir: str):
@@ -160,11 +108,7 @@ class LangIDFilter:
         if self.backend is None:
             self._init_langdetect()
         if self.backend is None:
-            raise RuntimeError(
-                "Neither fastText+lid.176 nor langdetect are available. "
-                "Install one: `pip install fasttext` (and let it fetch lid.176.bin) "
-                "or `pip install langdetect`."
-            )
+            raise RuntimeError("Neither fastText+lid.176 nor langdetect are available.")
 
     def _init_fasttext(self, cache_dir: str):
         try:
@@ -177,19 +121,8 @@ class LangIDFilter:
             if not os.path.exists(model_path):
                 print(f"Downloading fastText LID model to {model_path} ...")
                 urllib.request.urlretrieve(self.LID_URL, model_path)
-            fasttext.FastText.eprint = lambda *a, **k: (
-                None
-            )  # silence a harmless warning fastText prints
+            fasttext.FastText.eprint = lambda *a, **k: None
 
-            # fasttext is unmaintained by Meta and was never updated for
-            # NumPy>=2.0's stricter `copy=False` semantics: its predict()
-            # does `np.array(probs, copy=False)` on a plain Python tuple,
-            # which ALWAYS requires a copy and so ALWAYS raises ValueError
-            # under NumPy>=2.0 (not intermittent -- every single call). Worse,
-            # the exception then segfaults the interpreter on the way out of
-            # fastText's C++ extension. Patch just fastText's own `np` name
-            # binding (not numpy globally) to restore the old, working
-            # behavior: copy=False -> copy=None ("copy only if needed").
             _orig_np_array = fasttext.FastText.np.array
 
             def _np_array_compat(obj, copy=False, **kwargs):
@@ -203,7 +136,7 @@ class LangIDFilter:
             self.backend = "fasttext"
         except Exception as e:
             print(
-                f"[LangIDFilter] fastText unavailable ({e}); will try langdetect fallback"
+                f"[LangIDFilter] fastText unavailable ({e}); trying langdetect fallback"
             )
             self.backend = None
 
@@ -213,11 +146,10 @@ class LangIDFilter:
 
             self.backend = "langdetect"
         except Exception as e:
-            print(f"[LangIDFilter] langdetect unavailable too ({e})")
+            print(f"[LangIDFilter] langdetect unavailable ({e})")
             self.backend = None
 
     def predict(self, text: str) -> Tuple[str, float]:
-        """Returns (iso639_1_code, confidence)."""
         text = text.replace("\n", " ").strip()
         if not text:
             return "unk", 0.0
@@ -242,18 +174,7 @@ class LangIDFilter:
         return lang == expected_lang and conf >= threshold
 
 
-# ---------------------------------------------------------------------------
-# (2) + (3) Dedup and cross-corpus / test-set leakage removal, via an
-# inverted shingle index so we don't do an O(N*M) full scan of a multi-
-# million-line corpus against every FLORES sentence.
-# ---------------------------------------------------------------------------
 class NearDupIndex:
-    """Inverted index: char-5-gram shingle -> set of reference-sentence ids
-    that contain it. Given a candidate sentence, we only need to Jaccard-
-    compare against reference sentences that share at least one shingle,
-    which in practice is a tiny candidate set even for a large reference
-    collection, making this tractable at multi-million-line scale."""
-
     def __init__(self, reference_sentences: List[str], n: int = 5):
         self.n = n
         self.refs = reference_sentences
@@ -284,27 +205,7 @@ class NearDupIndex:
         return False
 
 
-def exact_dedup(lines: Iterable[str]) -> List[str]:
-    seen: Set[str] = set()
-    out = []
-    for line in lines:
-        h = hashlib.md5(normalize_for_hash(line).encode("utf-8")).hexdigest()
-        if h not in seen:
-            seen.add(h)
-            out.append(line)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# FLORES+ fetch (gated dataset; falls back to an ungated community mirror)
-# ---------------------------------------------------------------------------
 def fetch_flores_sentences(lang_code_flores: str) -> Dict[str, List[str]]:
-    """Returns {'dev': [...], 'devtest': [...]} sentences for one FLORES+
-    language code (e.g. 'eng_Latn', 'fin_Latn'). Tries the current, actively
-    maintained openlanguagedata/flores_plus first (requires `huggingface-cli
-    login` / an HF token with the dataset's terms accepted -- gated as of
-    this writing), then falls back to the ungated Muennighoff/flores200
-    mirror of the same underlying FLORES-200 data if that fails."""
     from datasets import load_dataset
 
     try:
@@ -314,7 +215,7 @@ def fetch_flores_sentences(lang_code_flores: str) -> Dict[str, List[str]]:
         return {"dev": dev, "devtest": devtest}
     except Exception as e:
         print(
-            f"[flores] openlanguagedata/flores_plus failed ({e}); trying Muennighoff/flores200 mirror"
+            f"[flores] openlanguagedata/flores_plus failed ({e}); using Muennighoff/flores200 mirror"
         )
         ds = load_dataset(
             "Muennighoff/flores200", lang_code_flores, trust_remote_code=True
@@ -324,16 +225,13 @@ def fetch_flores_sentences(lang_code_flores: str) -> Dict[str, List[str]]:
         return {"dev": dev, "devtest": devtest}
 
 
-# ---------------------------------------------------------------------------
-# Main per-language pipeline
-# ---------------------------------------------------------------------------
 def build_monolingual_corpus(
     lang: str,
     wiki_lang_code: str,
     out_path: str,
     cache_dir: str,
     flores_leak_index: NearDupIndex,
-    max_sentences: int = 3_000_000,
+    max_sentences: int = 500_000,
     min_chars: int = 10,
     max_chars: int = 500,
 ) -> int:
@@ -379,14 +277,15 @@ def build_monolingual_corpus(
         f"[{lang}] kept {kept} sentences "
         f"(dropped: {n_dropped_len} bad-length, {n_dropped_lid} failed LID, {n_dropped_leak} FLORES-leak)"
     )
+
+    # Clean up streaming dataset instance and trigger GC
+    del ds
+    gc.collect()
+
     return kept
 
 
 def cross_corpus_dedup_check(path_a: str, path_b: str) -> int:
-    """Defensive check: how many normalized lines are identical across the
-    two supposedly-disjoint-language corpora? Should be ~0 (stray numbers/
-    URLs/proper nouns at most). Logged, not silently ignored, so leakage is
-    visible rather than assumed away."""
     with open(path_a, encoding="utf-8") as f:
         set_a = {normalize_for_hash(l) for l in f}
     with open(path_b, encoding="utf-8") as f:
@@ -410,7 +309,7 @@ def main():
             os.environ.get("UNMT_WORK_DIR", "/kaggle/working/unmt-en-fi"), "cache"
         ),
     )
-    ap.add_argument("--max_sentences_per_lang", type=int, default=3_000_000)
+    ap.add_argument("--max_sentences_per_lang", type=int, default=500_000)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -428,7 +327,6 @@ def main():
         f"FLORES+ reference set for leakage-checking: {len(all_flores_sentences)} sentences"
     )
 
-    # persist FLORES splits for evaluate.py to consume later, unmodified
     with open(os.path.join(args.out_dir, "flores_en.json"), "w") as f:
         json.dump(flores_en, f)
     with open(os.path.join(args.out_dir, "flores_fi.json"), "w") as f:
@@ -446,13 +344,15 @@ def main():
 
     n_overlap = cross_corpus_dedup_check(en_path, fi_path)
     print(
-        f"Cross-corpus identical-line check (EN vs FI, should be ~0): {n_overlap} shared normalized lines"
+        f"Cross-corpus identical-line check (EN vs FI): {n_overlap} shared normalized lines"
     )
-    if n_overlap > 0:
-        print(
-            "  (a handful is normal -- bare numbers, URLs, or identical proper nouns; "
-            "investigate if this number is more than a few dozen)"
-        )
+
+    print("\n[data_prepare] Stage 0 data preparation finished successfully.")
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Immediate OS-level exit to avoid PyGILState_Release crash from background PyArrow/fsspec threads
+    os._exit(0)
 
 
 if __name__ == "__main__":
