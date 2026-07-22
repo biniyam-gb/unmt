@@ -1,5 +1,6 @@
 """
-Stage C: online back-translation training with live translation sample logging.
+Stage C: online back-translation with DAE loss regularization and synthetic
+noising to prevent identity collapse (copying trap).
 """
 
 import argparse
@@ -11,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from batching import infinite_batch_iterator
+from batching import infinite_dae_batch_iterator
 from binarize import BinarizedCorpus, load_resolved_vocab_size
 from config import (
     BOS_ID,
@@ -31,7 +32,8 @@ from config import (
     WARMUP_STEPS,
 )
 from model import SharedTransformerNMT
-from train_dae import noam_lr_lambda
+from noise import noise_sentence
+from train_dae import dae_loss, noam_lr_lambda
 from utils_dist import (
     WallClockCheckpointTrigger,
     cleanup_ddp,
@@ -59,6 +61,30 @@ def back_translate_batch(
     if was_training:
         raw_model.train()
     return synthetic
+
+
+def noise_tensor_batch(tensor_batch: torch.Tensor, device) -> torch.Tensor:
+    """Applies word dropout and local shuffle to synthetic batches to prevent
+    the model from memorizing verbatim identity mappings."""
+    noised_list = []
+    for row in tensor_batch:
+        clean_ids = [
+            int(t) for t in row.tolist() if int(t) not in (PAD_ID, BOS_ID, EOS_ID)
+        ]
+        noised_ids = noise_sentence(clean_ids)
+        noised_list.append(noised_ids)
+
+    max_len = max(len(s) for s in noised_list) + 2 if noised_list else 2
+    B = len(noised_list)
+    import numpy as np
+
+    out = np.full((B, max_len), PAD_ID, dtype=np.int64)
+    for b, seq in enumerate(noised_list):
+        out[b, 0] = BOS_ID
+        if seq:
+            out[b, 1 : 1 + len(seq)] = seq
+        out[b, 1 + len(seq)] = EOS_ID
+    return torch.from_numpy(out).to(device)
 
 
 def reconstruction_loss(
@@ -116,10 +142,12 @@ def main():
 
     corpus_en = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_A}"))
     corpus_fi = BinarizedCorpus(os.path.join(args.data_dir, f"bin.{LANG_B}"))
-    it_en = infinite_batch_iterator(
+
+    # Use DAE iterators to supply noised + clean pairs for joint DAE+BT training
+    it_en = infinite_dae_batch_iterator(
         corpus_en, args.max_tokens_per_batch, seed=300 + rank, device=device
     )
-    it_fi = infinite_batch_iterator(
+    it_fi = infinite_dae_batch_iterator(
         corpus_fi, args.max_tokens_per_batch, seed=400 + rank, device=device
     )
 
@@ -170,25 +198,39 @@ def main():
     en_id, fi_id = LANG_IDS[LANG_A], LANG_IDS[LANG_B]
 
     for step in range(start_step, args.max_steps):
-        x_en = next(it_en)
-        x_fi = next(it_fi)
+        noised_en, clean_en = next(it_en)
+        noised_fi, clean_fi = next(it_fi)
 
+        # 1. Back-translation generation (current weights)
         synth_fi = back_translate_batch(
-            raw_model, x_en, en_id, fi_id, MODEL_CFG.max_len
+            raw_model, clean_en, en_id, fi_id, MODEL_CFG.max_len
         )
         synth_en = back_translate_batch(
-            raw_model, x_fi, fi_id, en_id, MODEL_CFG.max_len
+            raw_model, clean_fi, fi_id, en_id, MODEL_CFG.max_len
         )
+
+        # 2. Apply noise to synthetic back-translations to prevent identity memorization
+        noised_synth_fi = noise_tensor_batch(synth_fi, device)
+        noised_synth_en = noise_tensor_batch(synth_en, device)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=fp16, dtype=torch.float16):
-            loss_fi2en = reconstruction_loss(
-                model, synth_fi, x_en, fi_id, en_id, LABEL_SMOOTHING
+            # Back-translation reconstruction loss
+            loss_bt_fi2en = reconstruction_loss(
+                model, noised_synth_fi, clean_en, fi_id, en_id, LABEL_SMOOTHING
             )
-            loss_en2fi = reconstruction_loss(
-                model, synth_en, x_fi, en_id, fi_id, LABEL_SMOOTHING
+            loss_bt_en2fi = reconstruction_loss(
+                model, noised_synth_en, clean_fi, en_id, fi_id, LABEL_SMOOTHING
             )
-            loss = (loss_fi2en + loss_en2fi) / 2
+            loss_bt = (loss_bt_fi2en + loss_bt_en2fi) / 2
+
+            # Joint DAE loss (prevents identity collapse & maintains language IDs)
+            loss_dae_en = dae_loss(model, noised_en, clean_en, en_id, LABEL_SMOOTHING)
+            loss_dae_fi = dae_loss(model, noised_fi, clean_fi, fi_id, LABEL_SMOOTHING)
+            loss_dae = (loss_dae_en + loss_dae_fi) / 2
+
+            # Combined loss: L_BT + L_DAE
+            loss = loss_bt + loss_dae
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -201,12 +243,11 @@ def main():
             elapsed = time.time() - t0
             print(
                 f"[BT] step {step}/{args.max_steps}  loss={loss.item():.4f} "
-                f"(fi->en={loss_fi2en.item():.4f} en->fi={loss_en2fi.item():.4f})  "
+                f"(bt={loss_bt.item():.4f} dae={loss_dae.item():.4f})  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}  elapsed={elapsed / 60:.1f}min"
             )
 
-            # Live qualitative translation inspection
-            if sp_proc is not None and x_en.size(0) > 0 and synth_fi.size(0) > 0:
+            if sp_proc is not None and clean_en.size(0) > 0 and synth_fi.size(0) > 0:
 
                 def _decode(tensor_row):
                     toks = [
@@ -217,9 +258,9 @@ def main():
                     return sp_proc.decode(toks)
 
                 print(f"  [Live Translation Check @ Step {step}]")
-                print(f"    EN -> FI  | SRC: {_decode(x_en[0])[:85]}")
+                print(f"    EN -> FI  | SRC: {_decode(clean_en[0])[:85]}")
                 print(f"              | GEN: {_decode(synth_fi[0])[:85]}")
-                print(f"    FI -> EN  | SRC: {_decode(x_fi[0])[:85]}")
+                print(f"    FI -> EN  | SRC: {_decode(clean_fi[0])[:85]}")
                 print(f"              | GEN: {_decode(synth_en[0])[:85]}\n")
 
         should_checkpoint = is_main_process(rank) and (
