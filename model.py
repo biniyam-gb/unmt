@@ -49,15 +49,21 @@ class SharedTransformerNMT(nn.Module):
             dropout=cfg.dropout, activation="gelu", batch_first=True, norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_enc_layers,
-                                              norm=nn.LayerNorm(cfg.d_model),
-                                              enable_nested_tensor=False)
+                                              norm=None, enable_nested_tensor=False)
 
         dec_layer = nn.TransformerDecoderLayer(
             d_model=cfg.d_model, nhead=cfg.n_heads, dim_feedforward=cfg.d_ff,
             dropout=cfg.dropout, activation="gelu", batch_first=True, norm_first=True,
         )
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=cfg.n_dec_layers,
-                                              norm=nn.LayerNorm(cfg.d_model))
+                                              norm=None)
+
+        # Per-language output norms: separate gain/bias per language replaces the
+        # single shared LayerNorm that encoder/decoder would otherwise apply.
+        # This forces the model to condition on language at the output layer,
+        # preventing the decoder from ignoring tgt_lang_id and copying the source.
+        self.enc_norm = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in range(cfg.n_langs)])
+        self.dec_norm = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in range(cfg.n_langs)])
 
         # Weight tying: output projection shares weights with input token embedding
         # (Press & Wolf 2017). Saves ~16M params at vocab=32000, d_model=512 and
@@ -90,6 +96,7 @@ class SharedTransformerNMT(nn.Module):
         src_kpm = self._padding_mask(src_ids)
         x = self._embed(src_ids, src_lang_id)
         memory = self.encoder(x, src_key_padding_mask=src_kpm)
+        memory = self.enc_norm[src_lang_id](memory)
         return memory, src_kpm
 
     @staticmethod
@@ -106,6 +113,7 @@ class SharedTransformerNMT(nn.Module):
         y = self._embed(tgt_in_ids, tgt_lang_id)
         h = self.decoder(y, memory, tgt_mask=causal, tgt_key_padding_mask=tgt_kpm,
                           memory_key_padding_mask=src_kpm)
+        h = self.dec_norm[tgt_lang_id](h)
         logits = F.linear(h, self.token_emb.weight, self.output_bias)
         return logits
 
@@ -189,7 +197,7 @@ class SharedTransformerNMT(nn.Module):
                 new_cache.append(full_raw)
             cache = new_cache
 
-            x = self.decoder.norm(x)  # nn.TransformerDecoder applies its final norm once, after all layers
+            x = self.dec_norm[tgt_lang_id](x)
             logits = F.linear(x, self.token_emb.weight, self.output_bias)  # (B,1,V)
             next_tok = logits[:, -1, :].argmax(-1)
             next_tok = torch.where(finished, torch.full_like(next_tok, PAD_ID), next_tok)

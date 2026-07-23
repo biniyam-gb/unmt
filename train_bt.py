@@ -161,9 +161,10 @@ def main():
         if is_main_process(rank):
             print(f"Resuming BT training from step {start_step}")
     elif os.path.exists(dae_ckpt_path):
-        load_checkpoint(dae_ckpt_path, model, map_location=device)
+        load_checkpoint(dae_ckpt_path, model, map_location=device, strict=False)
         if is_main_process(rank):
-            print(f"Bootstrapped BT weights from DAE checkpoint ({dae_ckpt_path})")
+            print(f"Bootstrapped BT weights from DAE checkpoint ({dae_ckpt_path}) "
+                  f"(missing keys like enc_norm/dec_norm initialized fresh if absent)")
     else:
         if is_main_process(rank):
             print("WARNING: Starting BT from a randomly-initialized model.")

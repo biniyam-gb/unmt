@@ -71,10 +71,10 @@ def save_checkpoint(path: str, model, optimizer, scaler, step: int, extra: dict 
     os.replace(tmp_path, path)  # atomic on POSIX -- avoids a half-written checkpoint if killed mid-save
 
 
-def load_checkpoint(path: str, model, optimizer=None, scaler=None, map_location="cpu", scheduler=None):
+def load_checkpoint(path: str, model, optimizer=None, scaler=None, map_location="cpu", scheduler=None, strict=True):
     payload = torch.load(path, map_location=map_location)
     raw_model = model.module if hasattr(model, "module") else model
-    raw_model.load_state_dict(payload["model"])
+    raw_model.load_state_dict(payload["model"], strict=strict)
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None and payload.get("scaler") is not None:
