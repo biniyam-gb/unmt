@@ -48,7 +48,11 @@ LR_SCALE = 1.0
 WARMUP_STEPS = 4000
 LABEL_SMOOTHING = 0.1
 GRAD_CLIP = 1.0
-DAE_LAMBDA = 0.5       # weight of DAE loss during BT: L = L_bt + DAE_LAMBDA * L_dae
+DAE_LAMBDA = 1.0       # weight of DAE loss during BT: L = L_bt + DAE_LAMBDA * L_dae.
+                        # 1.0 gives equal gradient contribution from BT and DAE.
+                        # Increase (e.g. 2.0) if the model copies instead of translating
+                        # at early BT steps; decrease (0.5) once BT is producing real
+                        # cross-lingual output in live translation checks.
 
 DAE_STEPS = 1000
 BT_STEPS = 2000
