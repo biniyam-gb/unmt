@@ -22,9 +22,9 @@ import torch.nn.functional as F
 from config import MODEL_CFG, LANG_A, LANG_B, LANG_IDS, PAD_ID, LABEL_SMOOTHING, MAX_TOKENS_PER_BATCH
 from model import SharedTransformerNMT
 from binarize import BinarizedCorpus, load_resolved_vocab_size
-from batching import infinite_dae_batch_iterator, infinite_batch_iterator
+from batching import infinite_dae_batch_iterator
 from train_dae import dae_loss
-from train_bt import back_translate_batch, reconstruction_loss
+from train_bt import back_translate_batch, reconstruction_loss, noise_tensor_batch
 
 
 def profile_stage(name: str, step_fn, n_warmup: int = 3, n_measure: int = 20) -> float:
@@ -91,20 +91,25 @@ def main():
 
     sec_per_dae_step = profile_stage("DAE", dae_step)
 
-    # --- BT step (generation + training, the expensive one) ---
-    it_en_bt = infinite_batch_iterator(corpus_en, args.max_tokens_per_batch, device=device)
-    it_fi_bt = infinite_batch_iterator(corpus_fi, args.max_tokens_per_batch, device=device)
+    # --- BT step (generation + noising + DAE + training — matches real train_bt.py) ---
+    bt_it_en = infinite_dae_batch_iterator(corpus_en, args.max_tokens_per_batch, device=device)
+    bt_it_fi = infinite_dae_batch_iterator(corpus_fi, args.max_tokens_per_batch, device=device)
 
     def bt_step():
-        x_en = next(it_en_bt)
-        x_fi = next(it_fi_bt)
-        n_tok = int((x_en != PAD_ID).sum() + (x_fi != PAD_ID).sum())
-        synth_fi = back_translate_batch(model, x_en, en_id, fi_id, MODEL_CFG.max_len)
-        synth_en = back_translate_batch(model, x_fi, fi_id, en_id, MODEL_CFG.max_len)
+        noised_en, clean_en = next(bt_it_en)
+        noised_fi, clean_fi = next(bt_it_fi)
+        n_tok = int((clean_en != PAD_ID).sum() + (clean_fi != PAD_ID).sum())
+        synth_fi = back_translate_batch(model, clean_en, en_id, fi_id, MODEL_CFG.max_len)
+        synth_en = back_translate_batch(model, clean_fi, fi_id, en_id, MODEL_CFG.max_len)
+        noised_synth_fi = noise_tensor_batch(synth_fi, device)
+        noised_synth_en = noise_tensor_batch(synth_en, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=fp16, dtype=torch.float16):
-            loss = (reconstruction_loss(model, synth_fi, x_en, fi_id, en_id, LABEL_SMOOTHING)
-                    + reconstruction_loss(model, synth_en, x_fi, en_id, fi_id, LABEL_SMOOTHING)) / 2
+            loss_bt = (reconstruction_loss(model, noised_synth_fi, clean_en, fi_id, en_id, LABEL_SMOOTHING)
+                       + reconstruction_loss(model, noised_synth_en, clean_fi, en_id, fi_id, LABEL_SMOOTHING)) / 2
+            loss_dae = (dae_loss(model, noised_en, clean_en, en_id, LABEL_SMOOTHING)
+                        + dae_loss(model, noised_fi, clean_fi, fi_id, LABEL_SMOOTHING)) / 2
+            loss = loss_bt + loss_dae
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()

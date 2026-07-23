@@ -19,6 +19,7 @@ from config import (
     BT_STEPS,
     CHECKPOINT_EVERY_SECONDS,
     CHECKPOINT_EVERY_STEPS,
+    DAE_LAMBDA,
     EOS_ID,
     GRAD_CLIP,
     LABEL_SMOOTHING,
@@ -230,8 +231,8 @@ def main():
             loss_dae_fi = dae_loss(model, noised_fi, clean_fi, fi_id, LABEL_SMOOTHING)
             loss_dae = (loss_dae_en + loss_dae_fi) / 2
 
-            # Combined loss: L_BT + L_DAE
-            loss = loss_bt + loss_dae
+            # Combined loss: L_BT + DAE_LAMBDA * L_DAE
+            loss = loss_bt + DAE_LAMBDA * loss_dae
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -244,7 +245,7 @@ def main():
             elapsed = time.time() - t0
             print(
                 f"[BT] step {step}/{args.max_steps}  loss={loss.item():.4f} "
-                f"(bt={loss_bt.item():.4f} dae={loss_dae.item():.4f})  "
+                f"(bt={loss_bt.item():.4f} dae={loss_dae.item():.4f} λ={DAE_LAMBDA})  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}  elapsed={elapsed / 60:.1f}min"
             )
 

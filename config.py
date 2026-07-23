@@ -48,6 +48,7 @@ LR_SCALE = 1.0
 WARMUP_STEPS = 4000
 LABEL_SMOOTHING = 0.1
 GRAD_CLIP = 1.0
+DAE_LAMBDA = 0.5       # weight of DAE loss during BT: L = L_bt + DAE_LAMBDA * L_dae
 
 DAE_STEPS = 1000
 BT_STEPS = 2000
